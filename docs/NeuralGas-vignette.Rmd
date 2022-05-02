@@ -1,0 +1,301 @@
+---
+output:
+  distill::distill_article:
+    toc: true
+    highlight: haddock
+    highlight_downlit: false
+  pdf_document:
+    toc: true
+    citation_package: biblatex #OR natbib
+    keep_tex: true
+    fig_caption: true
+    latex_engine: pdflatex
+    number_sections: true
+    highlight: haddock
+    template: ../../RPKG-vignette-template.tex
+bibliography: NeuralGas-vignette.bib
+graphics: yes
+header-includes:
+  -  \usepackage{hyperref}
+  -  \setlength{\parindent}{0pt}
+  -  \setlength{\parskip}{0.5em}
+  -  \usepackage{mathtools}
+  -  \usepackage{amssymb}
+  -  \usepackage{booktabs}
+  -  \usepackage{float}
+  -  \usepackage[nodisplayskipstretch]{setspace} # to provent extra spacing after display math mode 
+biblio-style: ieee
+title: "NeuralGas Vignette"
+#subtitle: "R Interaction for NeuroScope Products"  
+#thanks: ""
+author:
+- name: Josh Taylor 
+  affiliation: Rice University 
+abstract: "R Interface for NeuralGas Prototype Learning"
+description: "R Interface for NeuralGas Prototype Learning"  
+#keywords: "pandoc, r markdown, knitr"
+date: "June 3, 2021"
+geometry: margin=1in
+fontfamily: kpfonts #mathpazo, bookman, arev, 
+#fontfamilyoptions: any options required for \usepackage[options]{fontname}
+fontsize: 11pt
+spacing: onehalf
+endnote: no
+---
+
+```{r setup, include=FALSE, purl=F}
+knitr::opts_chunk$set(echo = TRUE, eval = T, collapse = T, fig.align='center')
+#knitr::opts_chunk$set(fig.pos = '!H')
+```
+
+<!--- The following script allows cross-referencing equations when rendering to html -->
+<script type="text/x-mathjax-config">
+MathJax.Hub.Config({
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+});
+</script>
+
+
+# Preface {-}
+
+`NeuralGas` is an R package for Neural Gas prototype learning.  The main package features are: 
+
+* Exposure of both online and batch learning algorithms
+* Fast and efficient C++ implementations of the above (based on [Rcpp](https://cran.r-project.org/web/packages/Rcpp/index.html) and [RcppArmadillo](https://cran.r-project.org/web/packages/RcppArmadillo/index.html))
+* Optional parallel computation during training via [RcppParallel](https://cran.r-project.org/web/packages/RcppParallel/index.html)
+
+
+# The Neural Gas Algorithm 
+
+Given $N$ data vectors $X = \{x_i\} \in \mathbb{R}^d$, Neural Gas [@martinetz:gas] finds, via competitive and cooperate learning, $M$ **prototypes** $W = \{w_j\} \in \mathbb{R}^d$ by minimizing the following cost function:
+\begin{equation} \label{eq:NGcost}
+NG_{Cost} = \sum\limits_i \sum\limits_j h_{ij} \times d(x_i, w_j). 
+\end{equation}
+Here, $d(x_i,w_j)$ is standard Euclidean distance from datum $x_i$ to prototype $w_j$.  The **neighborhood function** $h_{ij} = \exp(-k_{ij} / \lambda)$ controls the degree of cooperation among prototypes during learning. The term $k_{ij}$ represents the ascending **rank** of the distance from $x_i$ to $w_j$ with respect to the distances to all other prototypes $w_k$, i.e.,
+$$k_{ij} = | \{w_j \, | d(x_i,w_j) < d(x_i,w_k)\} |.$$
+By convention, $k_{ij} \in \{0,1,\ldots,M-1\}$.  The user-supplied parameter $\lambda$ controls the size of the cooperative neighborhood; $\lambda \to 0$ induces less cooperation among prototypes during learning while $\lambda \to \infty$ induces a greater degree of cooperation. $\lambda$ should be annealed during training to ensure network convergence. 
+
+As the prototypes $W$ induce a vector quantization (VQ) of $X$ we present some common terms related to a VQ mapping and quality which will be referenced below: 
+
+* The **B**est **M**atching **U**nit of a datum $x_i$ is the index of its closest prototype: 
+$$BMU_i = \arg\min_j d(x_i, w_j)$$.
+* The quantization error of $x_i$ by its BMU is: 
+$$QE_i = d(x_i, w_{BMU_i})$$. 
+* The **M**ean **Q**uantization **E**rror made by quantizing all of $X$ by $W$ is: 
+$$MQE = \frac{1}{N} \sum_i QE_i$$. 
+* The **R**eceptive **F**ield of prototype $w_j$ is the set of $x_i$ mapped to $w_j$:  
+$$RF_j = \{x_i \, | \, BMU_i=j\}$$
+* The size (cardinality) of a RF is denoted $|RF_j|$.  
+* The (normalized) Shannon entropy of the discretization of $X$ by $W$ is: 
+$$Entropy = \frac{1}{\log(M)} \sum_j \frac{|RF_j|}{N} \times \log\left(\frac{|RF_j|}{N}\right)$$ 
+If each datum $x_i$ has an associated label $\ell_i$ we can compute the additional quantities:
+* The label of each RF (equivalently, prototype) is obtained by plurality vote of the data labels it contains: 
+$$WL_j = \arg\max_{\ell} p_{RFL_j}(\ell),$$ 
+where $p_{RFL_j}(\cdot)$ is the empirical distribution of data labels in $RF_j$.  
+* The Purity of each RF $\pi_j$ measures how much label confusion exists in the RF: 
+$$\pi_j = \max_{\ell} p_{RFL_j}(\ell),$$ 
+Ideally, if the labels indicate well separated classes / clusters we would have $\pi_j = 1 \, \forall \, j$.  
+* The overall purity of the mapping is the weighted overall average of each RF's purity score, weighted by its size: 
+$$\Pi = \frac{1}{N} \sum_j |RF_j| \times \pi_j$$
+* The Hellinger distance between the empirical categorical distributions of the data labels ($p_{XL}(\ell)$) and RF labels ($p_{RFL}(\ell)$) measures how well the RF labeling represents the data labeling: 
+$$ Hellinger = \left( 1 - \sum_{\ell}  \sqrt{ p_{XL}(\ell) \, p_{RFL}(\ell)} \right)^{\frac{1}{2}}$$
+
+
+## Online Learning 
+
+Online learning minimizes $\eqref{eq:NGcost}$ over $W$ via stochastic gradient descent according to the update rule: 
+$$ w_j(s+1) = w_j(s) + \alpha  h_{ij}  (x_i - w_j)$$
+where $s$ indicates the current learning iteration and $\alpha$ is the user-supplied learning rate controlling the SGD step sizes.  For online learning, $s$ increments after presentation of a single datum to the network for training. 
+
+## Batch Learning 
+
+Batch learning minimizes $\eqref{eq:NGcost}$ over $W$ via gradient descent with prototype updates at each epoch $t$ defined by
+$$ w_j(t) = \frac{\sum\limits_i h_{ij} x_i}{\sum\limits_i h_{ij}}.$$
+The batch update rule was shown in [@cottrell2006] to be equivalent to minimization of $\eqref{eq:NGcost}$ via Newton's method. This second order optimization was shown in [@cottrell2006] to be much faster than online Neural Gas learning (i.e., requires fewer training iterations) with no impact on the quality of the resulting vector quantization.  The denominator in the batch update rule supplants the need for a user-supplied learning rate.  For batch learning, $t$ increments after presentation of all $N$ data vectors to the network (an epoch). 
+
+## Prototype Initialization 
+
+Both batch and online learning update the prototypes $W$ iteratively, requiring an initialization of $W_0$.  Typically this occurs randomly (uniformly) in the range of $X$, which is the default behavior in the `NeuralGas` package. A user-supplied initialization is also accepted, as demonstrated in the Iris example [User-Supplied Prototype Initializations].
+
+See `NGWInitialization` for more information. 
+
+## Annealing 
+
+$\lambda$ and $\alpha$ (for online learning) should both be annealed during training to ensure its stability and convergence, which requires them to be non-increasing functions of the learning iteration $s$ or epoch $t$.  The `NeuralGas` package allows for both multiplicative and scheduled decay of both of these rates.  Multiplicative decay is of the form 
+$$ \lambda^M(t) = \lambda_0 \times \eta_{\lambda}^{t-1}, \quad \alpha^M(t) = \alpha_0 \times \eta_{\alpha}^{t-1}$$ 
+where $\eta_{*} < 1$ is a decay factor.  Scheduled decay allows step-wise decreases to the rates at a series of user-supplied iterations. For example, we could specify the following piecewise constant schedule for $\alpha$:
+$$ \alpha^S(s) = \begin{cases} 0.9 & s \leq 5 \\ 0.5 & 5 < s \leq 10 \\ 0.1 & s > 10 \end{cases}$$
+
+## Monitoring Learning 
+
+After every training epoch $t$ the following fitness measures of the NG network's vector quantization are computed and stored. Note that for online learning, we consider an "epoch" to constitute $N$ individual training iterations.  This **learning history** is stored in the `LearnHist` data frame of the list returned after convergence 
+
+
+* **Epoch** - the epoch for which measures are reported 
+* **alpha** - the prevailing learning rate (for online learning)
+* **lambda** - the previaling neighborhood parameter 
+* **Cost** - the prevailing value of $\eqref{eq:NGcost}$, divided by $N$ (division is done to place Cost on a similar scale to MQE)
+* **MQE** - Mean Quantization Error of all data
+* **NhbEff** - the effect of the current value of $\lambda$ on the network, defined as $Cost / MQE$. NhbEff is always $\geq$ 1, with values = 1 indicating no neighborhood effect, which occurs as $\lambda \to 0$.
+* **delCost** - the relative absolute percent change in Cost from the previous epoch:
+$$delCost(t) = \frac{Cost(t) - Cost(t-1)}{Cost(t-1)} \times 100$$
+* **delMQE** - the relative absolute percentage change in the Mean Quantization Error from the previous epoch: 
+* **delBMU** - the proportion of data whose BMU  has changed from the previous epoch: 
+$$delBMU(t) = \frac{1}{N} \sum\limits_i I \left[ BMU_t(x_i) \neq BMU_{t-1}(x_i) \right] \times 100 $$
+* **Entropy** - Normalized Shannon Entropy of the VQ mapping
+
+If data labels are given, the learning history also reports  
+
+* **PurityWOA** - the Weighted Overall Average of each RF's purity score 
+* **WLUnq** - the number of unique prototype labels which, when compared to the number of unique data labels, can help diagnose how well the prototypes represent rare classes 
+* **WLHell** - the Hellinger distance between the categorical distributions of the data and prototype labels 
+
+See `?NGLearnHist` for more information. 
+
+
+## Convergence 
+
+When training with the `NeuralGas` package, minimization of $\eqref{eq:NGcost}$ proceeds until the first occurrence of either of the following events: 
+
+* The number of training epochs exceeds a user-supplied parameter `max_epochs` 
+* The VQ becomes stable, by which we mean 
+`delBMU` drops below a user-supplied tolerance `tol_delBMU`, 
+AND 
+`delMQE` drops below a user-supplied tolerance `tol_delMQE`, 
+FOR 3 CONSECUTIVE EPOCHS.  Combined, these measures capture the stability of the VQ.  
+
+By default, `max_epochs = 999999`, `tol_delBMU = 1` and `tol_delMQE = 0.1` To train for a fixed number of epochs (regardless of the values of the stability measures), set `max_epochs` as desired and `tol_delBMU = tol_delMQE = 0`.  Again, for online learning we consider an epoch to comprise $N$ individual (stochastic) learning iterations $s$. 
+
+During training, early termination can be achieved by user interruption (typing CTRL-C in the R console window).  Upon detecting early termination, both batch and online learning will return the current state of the network (existing values of the prototypes and any training history logged before user interruption).  
+
+See `?NGConvergence` for more information. 
+
+# Example: Learning Iris
+
+We use Fisher's iris data to demonstrate the learning functionality of Neural Gas. To begin, strip out the iris measurements as a matrix $X$ and their labels as a vector $L$: 
+
+```{r}
+# Load library 
+library(NeuralGas)
+
+# Store iris data as a matrix
+X = as.matrix(iris[,1:4])
+str(X) 
+
+# Store iris labels 
+L = iris[,5]
+str(L)
+```
+
+## Learning 
+
+We will demonstrate batch Neural Gas learning of iris via The `NGBatch` function (online training is almost identical, except the learning rate $\alpha$ for SGD is also a required input; see `?NGOnline`). Its arguments, with defaults, are
+
+```{r}
+# View argument list of NGBatch function 
+args(NGBatch)
+```
+
+We have already prepared our data `X` and its label `L` above (if labels are unavailable simply do not supply a value for the argument `XL`).  We will train 30 neural gas prototypes, initialized randomly (uniformly) in the range of `X` with a fixed seed. We invoke this behavior by passing `W = c(30, 123)` to `NGBatch` (first element of the vector sets the number of prototypes, last sets the random seed at which their are drawn).  
+
+For this learning we will leave use multiplicative annealing and default values of `lambda0` (25% of the number of prototypes), its decay factor (0.9), and the convergence tolerances (`tol_delBMU = 1`, `tol_delMQE = 1`, `max_epochs = -1`).  Parallel processing is enabled by default (see `?RcppParallel::setThreadOptions` to change the number of threads used for parallel computation).  The `verbose` flag controls whether the learning histories are printed to the console during training; we disable this here to save space.  See `?NGBatch` for a more complete overview of this functionality. 
+
+```{r}
+# Batch iris training 
+ng.iris = NGBatch(X = X, W = c(30, 123), XL = L, verbose = F)
+str(ng.iris)
+```
+
+Looking at the structure of the list returned by `NGBatch` we see:
+
+* the matrix of learned prototypes in slot `W` (one prototype per row)
+* the number of epochs required to reach convergence = `r ng.iris$epochs`
+* the starting, ending and decay used for $\lambda$ (notice $\lambda_t = \lambda_{t-1} \times 0.9$, which is the default multiplicative decay rate)
+* the tolerances which controlled the convergence of this learning 
+* the execution time (in minutes)
+* the `LearnHist` data frame, see `?NGLearnHist` for more details. We examine the learning history for the first and last 5 epochs below, formatted with the `kableExtra` package for easier reading: 
+
+::: {.tiny}
+```{r, fig.pos='H'}
+# View a tidy version of LearnHist
+library(kableExtra)
+view_rows = c(1:5, (ng.iris$epochs-5+1):ng.iris$epochs)
+kbl(ng.iris$LearnHist[view_rows,], row.names = F, 
+    digits = c(0, rep(3,9), 0, 3), booktabs = T) %>% 
+  kable_styling(latex_options = c('scale_down',"hold_position"))
+```
+:::
+
+Learning appears successful, with all VQ measures improving as training progressed.  In particular note the values of `delMQE` and `delBMU`, which dropped below their tolerances for the last three training epochs (which triggered convergence and terminated learning).  
+
+## Visualizations
+
+We can visualize the learning curves related to convergence with the `vis_NGLearnHist` function included in the package (which requires the `ggplot2` package, see `?vis_NGLearnHist`)
+
+```{r}
+# Visualize the learning history 
+vis_NGLearnHist(ng.iris$LearnHist)
+```
+
+To inspect the actual prototype placement, we can look at pairs plots of data (gray) + prototypes (magenta) across the 4 dimensions of iris: 
+
+```{r}
+# View prototypes in data space 
+# First, combine the data & prototypes into one matrix for plotting 
+# Then specify different sizes & colors for prototype vs. data markers 
+pairs_data = rbind(X, ng.iris$W)
+pairs_sizes = c(rep(0.5,nrow(X)), rep(0.75, nrow(ng.iris$W)))
+pairs_colors = c(rep('darkgray',nrow(X)), rep('magenta', nrow(ng.iris$W)))
+pairs(pairs_data, cex = pairs_sizes, col = pairs_colors, pch=16)
+```
+
+
+## Scheduled Annealing 
+
+The above learning used multiplicative decay to anneal $\lambda$ as training progressed. Alternatively, an annealing schedule may be supplied as a named vector whose elements give the annealed values, and whose names specify the epoch **through which** the respective values are effective. For example, we can specify the following annealing schedule 
+$$ \lambda(t) = \begin{cases} 7 & t \leq 1 \\ 5 & 1 < t \leq 3 \\ 3 & 3 < t \leq 5 \\ 1 & t > 5 \end{cases} $$
+as a named vector `lambda_schedule`: 
+
+```{r}
+# Define a named vector for scheduled annealing 
+lambda_schedule = c(7, 5, 3, 1)  # the desired lambda values 
+schedule_epochs = c(1, 3, 5, 6)  # the epochs after which lambda changes
+names(lambda_schedule) = schedule_epochs
+```
+
+The last $\lambda$ value in the schedule will be repeated as needed if training extends beyond `max(schedule_epochs)` (so in this case, $\lambda = 1$ is used for any training epoch beyond 5).  Once built (as shown above), this schedule can be passed to the `lambda_schedule` argument of the `NGBatch` (or `NGOnline`) function. If using scheduled annealing, do not supply any values to the multliplicative annealing arguments (i.e., `lambda0`, `lambda_decay`, `alpha0`, `alpha_decay`). Checks will be performed to ensure the scheduling occurs at integers, and that `schedule_epochs` were supplied in non-decreasing order. The result of learning with our schedule specified above is: 
+
+```{r}
+# Batch learning with scheduled annealing 
+ng.iris.sched = NGBatch(X = X, W = c(30, 123), lambda_schedule = lambda_schedule, 
+                        XL = L, verbose = F)
+
+# View the LearnHist
+kbl(ng.iris.sched$LearnHist, row.names = F, 
+    digits = c(0, rep(3,9), 0, 3), booktabs = T) %>% 
+  kable_styling(latex_options = c('scale_down',"hold_position"))
+```
+
+We can see convergence occurred sooner (in `r ng.iris.sched$epochs` epochs vs. `r ng.iris$epochs`) with minimal impact on final MQE (`r round(ng.iris.sched$LearnHist$MQE[nrow(ng.iris.sched$LearnHist)], digits=3)` vs. `r round(ng.iris$LearnHist$MQE[nrow(ng.iris$LearnHist)], digits=3)`).  
+
+For online learning the schedule should be set in terms of learning iterations $s$ (not epochs $t$). Additionally, if using online learning with scheduled annealing, both $\alpha$ and $\lambda$ must be scheduled (i.e., either both are scheduled, or neither).  See `NGOnline` for details.  
+
+## User-Supplied Prototype Initializations
+
+Above we set the initial value of NG prototypes as random vectors selected uniformaly in the range of our data.  Alternatively, a user can supply a fixed matrix of prototypes to initialize. For example, initializing at randomly selected vectors of $X$ is common; we show how to achieve this below: 
+
+```{r}
+## Sample 30 vectors X to set initial prototypes 
+set.seed(123)
+use_these = sample.int(n = nrow(X), size = 30, replace = F)
+W0 = X[use_these,]
+
+## Train with default lambda and annealing 
+ng.iris = NGBatch(X = X, W = W0, XL = L, verbose = F)
+str(ng.iris)
+```
+
+
+# Administrative 
+
+Partial support was provided by E. Merényi, Rice University, D75802-790000.

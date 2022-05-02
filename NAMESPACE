@@ -1,0 +1,5 @@
+useDynLib(NeuralGas, .registration=TRUE)
+import(Rcpp)
+importFrom(RcppParallel, RcppParallelLibs) #
+exportPattern("^[[:alpha:]]+")
+

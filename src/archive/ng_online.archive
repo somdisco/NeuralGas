@@ -1,0 +1,565 @@
+#ifndef NEURALGAS_HPP
+#include "neuralgas.hpp"
+#endif
+
+
+struct dist_prototypes_prlwkr : RcppParallel::Worker {
+  
+  // Initial inputs 
+  const arma::mat& W;
+  const arma::rowvec &x; 
+  
+  // Internval Vars 
+  unsigned int nW; 
+  
+  // Outputs 
+  arma::vec dist; // distance from a single x to all W 
+  
+
+  // Constructor 
+  dist_prototypes_prlwkr(const arma::mat& W, const arma::rowvec& x) : W(W), x(x) {
+    nW = W.n_rows;
+    dist.set_size(nW); dist.zeros(); 
+  }
+  
+  void operator()(std::size_t begin, std::size_t end) {
+    for (std::size_t i = begin; i < end; i++) {
+      dist(i) = std::sqrt(arma::accu(arma::square(x-W.row(i))));
+    }
+  }
+  
+  // Parallel invoker 
+  void calc_parallel() {
+    RcppParallel::parallelFor(0, W.n_rows, *this);
+  }
+  
+  // Parallel invoker 
+  void calc_serial() {
+    for (unsigned int i = 0; i < W.n_rows; i++) {
+      dist(i) = std::sqrt(arma::accu(arma::square(x-W.row(i))));
+    }
+  }
+};
+
+struct update_prototypes_prlwkr : RcppParallel::Worker {
+  
+  arma::mat& W;
+  const double& alpha;
+  //const double& lambda;
+  const arma::rowvec& x; 
+  const arma::vec& nhb_factor; 
+  //const arma::uvec& rank; 
+  
+  unsigned int nW; 
+  
+  // Constructor 
+  // update_prototypes_prlwkr(arma::mat& W, const double& alpha, const double& lambda, const arma::rowvec& x, const arma::uvec& rank) : 
+  //   W(W), alpha(alpha), lambda(lambda), x(x), rank(rank) {
+  //   nW = W.n_rows;
+  // }
+  update_prototypes_prlwkr(arma::mat& W, const double& alpha, const arma::rowvec& x, const arma::vec& nhb_factor) : 
+    W(W), alpha(alpha), x(x), nhb_factor(nhb_factor) {
+    nW = W.n_rows;
+  }
+  
+  
+
+  void operator()(std::size_t begin, std::size_t end) {
+    for(unsigned int i = begin; i < end; i++) {
+      
+      //double nhb_factor = std::exp(-double(rank(i)) / lambda);
+      
+      arma::rowvec diff = x - W.row(i); 
+      //W.row(i) += alpha * nhb_factor * diff; 
+      W.row(i) += alpha * nhb_factor(i) * diff; 
+    }
+  }
+  
+  // Parallel invoker 
+  void calc_parallel() {
+    RcppParallel::parallelFor(0, W.n_rows, *this);
+  }
+  
+  // Parallel invoker 
+  void calc_serial() {
+    
+    for (unsigned int i = 0; i < W.n_rows; i++) {
+      
+      //double nhb_factor = std::exp(- double(rank(i)) / lambda);
+      
+      arma::rowvec diff = x - W.row(i); 
+      //W.row(i) += alpha * nhb_factor * diff; 
+      W.row(i) += alpha * nhb_factor(i) * diff; 
+    }
+  }
+};
+
+struct update_prototypes_ADAM_prlwkr : RcppParallel::Worker {
+  
+  arma::mat& W;
+  const double& lambda;
+  const arma::rowvec& x; 
+  const arma::uvec& rank; 
+  const unsigned int& iter; 
+  double alpha, beta1, beta2; 
+  
+  arma::mat m, v; 
+  
+  
+  unsigned int nW; 
+  
+  // Constructor 
+  update_prototypes_ADAM_prlwkr(arma::mat& W, const double& lambda, const arma::rowvec& x, const arma::uvec& rank, const unsigned int& iter, 
+                                double alpha, double beta1, double beta2) : 
+    W(W), lambda(lambda), x(x), rank(rank), iter(iter), alpha(alpha), beta1(beta1), beta2(beta2) {
+    nW = W.n_rows;
+    m = 0*W; 
+    v = 0*W; 
+  }
+  
+  
+  void operator()(std::size_t begin, std::size_t end) {
+    for(unsigned int i = begin; i < end; i++) {
+      
+      double nhb_factor = std::exp(-double(rank(i)) / lambda);
+      arma::rowvec grad = nhb_factor * (x - W.row(i)); 
+      
+      m.row(i) = beta1*m.row(i) + (1-beta1)*grad; 
+      v.row(i) = beta2*v.row(i) + (1-beta2)*arma::square(grad); 
+    }
+  }
+  
+  // Parallel invoker 
+  void calc_parallel() {
+    RcppParallel::parallelFor(0, W.n_rows, *this);
+    double alphat = alpha * std::sqrt(1 - std::pow(beta2,iter)) / (1 - std::pow(beta1,iter)); 
+    W += alphat * m / (arma::sqrt(v) + std::numeric_limits<double>::min()); 
+  }
+  
+  // // Parallel invoker 
+  // void calc_serial() {
+  //   
+  //   for (unsigned int i = 0; i < W.n_rows; i++) {
+  //     
+  //     double nhb_factor = std::exp(- double(rank(i)) / lambda);
+  //     
+  //     arma::rowvec diff = x - W.row(i); 
+  //     W.row(i) += eps * nhb_factor * diff; 
+  //   }
+  // }
+};
+
+
+// [[Rcpp::export(".cpp_NGLearn_online")]]
+Rcpp::List cpp_NGLearn_online(const arma::mat& X, arma::mat W, 
+                              double alpha, double alpha_decay, 
+                              double lambda, double lambda_decay, 
+                             double tol_delBMU = 1.0, double tol_delQE = 1.0, 
+                             int max_epochs = -1, 
+                             Rcpp::Nullable<Rcpp::IntegerVector> XLabel = R_NilValue, 
+                             bool parallel = true, bool verbose = true) {
+  
+  // Inputs: 
+  // X = data matrix, in external network range
+  // minX,maxX = limits of external network range; now compute this internally  
+  // W = prototype matrix, in internal network range [0,1] 
+  // lambda = starting lambda value for training 
+  // decay = decay rate, annealing done at every epoch according to lambda = lambda * decay
+  
+  // Setup random generator for sampling indices
+  std::default_random_engine generator;
+  std::uniform_int_distribution<unsigned int> distribution(0,X.n_rows-1);
+  
+  // *** Initialize containers related to learning 
+  double minX = X.min();        // external network range
+  double maxX = X.max(); 
+  double alpha0 = alpha;        // initial learning rate 
+  double lambda0 = lambda;      // initial neighborhood  
+  arma::rowvec x = X.row(0);    // the scaled sample @ each iter
+  arma::uvec rank(W.n_rows);    // the prototype rank @ each iter 
+  arma::vec nhb_factor(W.n_rows); 
+  unsigned int iter = 0;        // num of learning iters performed so far 
+  unsigned int age = 0;         // num of learning epochs performed so far (epoch = nX iters, nX = nrow(X))
+  
+  // *** Initialize containers related to monitoring & reporting 
+  unsigned int npass_delBMU = 0;  // num of consecutive monitorings the delBMU tol has been met 
+  unsigned int npass_delQE = 0;   // num of consecutive monitorings the delQE tol has been met 
+  bool exit_flag = false;         // whether all conv criteria have been met 
+  
+  
+  arma::uvec nXsampled(X.n_rows);  // num of times each data vector has been sampled 
+  nXsampled.zeros();          
+  arma::uvec BMUs(X.n_rows); 
+  BMUs.fill(std::numeric_limits<unsigned int>::quiet_NaN()); 
+  //BMUs.fill(); 
+  arma::vec QEs(X.n_rows);         // QE of all data @ current monitoring 
+  QEs.fill(arma::datum::nan); 
+  arma::vec Costs(X.n_rows);         // QE of all data @ current monitoring 
+  Costs.fill(arma::datum::nan); 
+  
+  NG_deltas deltas;
+  deltas.update(BMUs, QEs, Costs);
+  
+  // Learn history storage 
+  NG_learnhist_container lrnhist; 
+  
+  // *** Initialize prototype distance & update workers 
+  dist_prototypes_prlwkr DistWorker(W, x);
+  update_prototypes_prlwkr UpdateWorker(W, alpha, x, nhb_factor);
+  
+  
+  // *** Initialize the monitoring worker
+  // If labels were given, assign them to the worker as well 
+  VQQuality_worker VQMwkr(BMUs, W.n_rows);
+  bool is_labeled = false;
+  if(XLabel.isNotNull()) {
+    arma::uvec XLabel_;
+    XLabel_ = Rcpp::as<arma::uvec>(XLabel);
+    VQMwkr.set_XLabel(XLabel_);
+    is_labeled = true;
+  }
+  
+
+
+  // *** Start learning 
+  auto start_time = std::chrono::high_resolution_clock::now(); 
+  while(!exit_flag) {
+    
+    iter++; 
+    
+    // Sample an x and scale it to [0,1]
+    unsigned int Xidx = distribution(generator);
+    nXsampled(Xidx)++; 
+    x = (X.row(Xidx) - minX) / (maxX - minX); 
+    
+    // Compute distances to all prototypes, rank them
+    DistWorker.calc_parallel(); 
+    rank_prototypes(rank, BMUs(Xidx), QEs(Xidx), DistWorker.dist); 
+    
+    // Compute neighborhood factor from this x to all W 
+    nhb_factor = arma::exp(-arma::conv_to<arma::vec>::from(rank) / lambda);
+    
+    // Compute contribution to cost from this x 
+    Costs(Xidx) = arma::accu(nhb_factor % DistWorker.dist);
+    
+    // Update prototypes 
+    if(parallel) UpdateWorker.calc_parallel(); else UpdateWorker.calc_serial();
+    
+
+    if( iter % X.n_rows == 0) {
+      // Increment age
+      age++;
+      
+      // Compute monitoring measures and their changes 
+      deltas.update(BMUs, QEs, Costs);
+      if(parallel) VQMwkr.calc_parallel(); else VQMwkr.calc_serial(); 
+      
+      // Store measures 
+      lrnhist.epoch.push_back(age); 
+      lrnhist.alpha.push_back(alpha); 
+      lrnhist.lambda.push_back(lambda); 
+      lrnhist.cost.push_back(deltas.Cost); 
+      lrnhist.MQE.push_back(deltas.MQE);
+      lrnhist.nhb_effect.push_back(deltas.NhbEffect);
+      lrnhist.delCost.push_back(deltas.delCost); 
+      lrnhist.delQE.push_back(deltas.delQE); 
+      lrnhist.delBMU.push_back(deltas.delBMU);
+      lrnhist.RFEntropy.push_back(VQMwkr.RFEntropy);
+      
+      if(is_labeled) {
+        lrnhist.RFLPurity.push_back(VQMwkr.RFLWAvgPurity);
+        lrnhist.RFLBattacharyya.push_back(VQMwkr.RFLBattDist); 
+        lrnhist.RFLUnique.push_back(VQMwkr.RFLUnique);
+      }
+
+      
+      // Print measures, if requested 
+      if(verbose) {
+
+        // Print headers first, and after every 10 reports 
+        if(age % 10 == 1) {
+          Rprintf("%5s%10s%10s%10s%10s%10s%10s%10s%10s%10s", "Epoch", "alpha", "lambda", "Cost", "MQE", "NhbEff", "delCost", "delQE", "delBMU", "RFEnt");
+          if(is_labeled) Rprintf("%10s%10s%10s", "RFLPur", "RFLBatt", "RFLUnq"); 
+          Rprintf("\n");
+        }
+        
+        Rprintf("%5u", age);
+        Rprintf("%10.3f", alpha);
+        Rprintf("%10.3f", lambda);
+        Rprintf("%10.5f", deltas.Cost);
+        Rprintf("%10.5f", deltas.MQE);
+        Rprintf("%10.3f", deltas.NhbEffect);
+        Rprintf("%10.3f", deltas.delCost);
+        Rprintf("%10.3f", deltas.delQE);
+        Rprintf("%10.3f", deltas.delBMU);
+        Rprintf("%10.3f", VQMwkr.RFEntropy);
+
+        if(is_labeled) {
+          Rprintf("%10.3f", VQMwkr.RFLWAvgPurity);
+          Rprintf("%10.3f", VQMwkr.RFLBattDist);
+          Rprintf("%10d", VQMwkr.RFLUnique);
+        }
+        Rprintf("\n");
+      } // close printer block 
+      
+      
+      
+      // *** Check for convergence
+      if(age>1 && lrnhist.delBMU.back() < tol_delBMU) npass_delBMU++; else npass_delBMU = 0;
+      if(age>1 && lrnhist.delQE.back() < tol_delQE) npass_delQE++; else npass_delQE = 0;
+      
+      if(max_epochs > 0 && int(age) >= max_epochs) {exit_flag = true; break;} 
+      if(npass_delBMU >= 3 && npass_delQE >= 3) {exit_flag = true; break;}
+      
+      
+      // *** Check for user interrupt 
+      // Return partial results
+      try {Rcpp::checkUserInterrupt();} catch(Rcpp::internal::InterruptedException e) {break;}
+      
+    } // close epoch monitoring 
+    
+    // *** Anneal neighborhood
+    // Do this last, so that lambda doesn't decay anymore if we have terminated in check above 
+    alpha *= alpha_decay; 
+    lambda *= lambda_decay;
+    
+  } // close learning 
+  
+  // Stop the clock 
+  auto stop_time = std::chrono::high_resolution_clock::now(); 
+  std::chrono::duration<double, std::ratio<60,1>> exec_time = stop_time - start_time;
+  
+  // Scale W back to data range 
+  W = W*(maxX - minX) + minX; 
+  
+  // Build output list 
+  Rcpp::List out; 
+  out["W"] = W; 
+  out["age"] = iter; 
+  out["alpha_start"] = alpha0;
+  out["alpha_end"] = alpha; 
+  out["alpha_decay"] = alpha_decay; 
+  out["lambda_start"] = lambda0;
+  out["lambda_end"] = lambda; 
+  out["lambda_decay"] = lambda_decay; 
+  out["tol_delBMU"] = tol_delBMU; 
+  out["tol_delQE"] = tol_delQE; 
+  out["max_epochs"] = max_epochs; 
+  out["exec_time"] = exec_time.count(); 
+  out["LearnHist"] = lrnhist.get_LearnHistDF(); 
+  
+  return out; 
+  
+}
+
+
+// [[Rcpp::export(".cpp_NGLearn_online_sched")]]
+Rcpp::List cpp_NGLearn_online_sched(const arma::mat& X, arma::mat W, 
+                              Rcpp::NumericVector alpha_schedule, 
+                              Rcpp::NumericVector lambda_schedule, 
+                              double tol_delBMU = 1.0, double tol_delQE = 1.0, 
+                              int max_epochs = -1, 
+                              Rcpp::Nullable<Rcpp::IntegerVector> XLabel = R_NilValue, 
+                              bool parallel = true, bool verbose = true) {
+  
+  // Inputs: 
+  // X = data matrix, in external network range
+  // minX,maxX = limits of external network range; now compute this internally  
+  // W = prototype matrix, in internal network range [0,1] 
+  // lambda = starting lambda value for training 
+  // decay = decay rate, annealing done at every epoch according to lambda = lambda * decay
+  
+  // Decode decay schedules 
+  std::map<unsigned int, double> alpha_schedule_ = decode_schedule(alpha_schedule); 
+  std::map<unsigned int, double> lambda_schedule_ = decode_schedule(lambda_schedule); 
+  
+  // Setup random generator for sampling indices
+  std::default_random_engine generator;
+  std::uniform_int_distribution<unsigned int> distribution(0,X.n_rows-1);
+  
+  // *** Initialize containers related to learning 
+  double minX = X.min();        // external network range
+  double maxX = X.max(); 
+  double alpha = alpha_schedule_.lower_bound(0)->second ; 
+  double lambda = lambda_schedule_.lower_bound(0)->second ; 
+  double alpha0 = alpha;        // initial learning rate 
+  double lambda0 = lambda;      // initial neighborhood  
+  arma::rowvec x = X.row(0);    // the scaled sample @ each iter
+  arma::uvec rank(W.n_rows);    // the prototype rank @ each iter 
+  arma::vec nhb_factor(W.n_rows); 
+  unsigned int iter = 0;        // num of learning iters performed so far 
+  unsigned int age = 0;         // num of learning epochs performed so far (epoch = nX iters, nX = nrow(X))
+  
+  // *** Initialize containers related to monitoring & reporting 
+  unsigned int npass_delBMU = 0;  // num of consecutive monitorings the delBMU tol has been met 
+  unsigned int npass_delQE = 0;   // num of consecutive monitorings the delQE tol has been met 
+  bool exit_flag = false;         // whether all conv criteria have been met 
+  
+  
+  arma::uvec nXsampled(X.n_rows);  // num of times each data vector has been sampled 
+  nXsampled.zeros();          
+  arma::uvec BMUs(X.n_rows); 
+  BMUs.fill(std::numeric_limits<unsigned int>::quiet_NaN()); 
+  //BMUs.fill(); 
+  arma::vec QEs(X.n_rows);         // QE of all data @ current monitoring 
+  QEs.fill(arma::datum::nan); 
+  arma::vec Costs(X.n_rows);         // QE of all data @ current monitoring 
+  Costs.fill(arma::datum::nan); 
+  
+  NG_deltas deltas;
+  deltas.update(BMUs, QEs, Costs);
+  
+  // Learn history storage 
+  NG_learnhist_container lrnhist; 
+  
+  // *** Initialize prototype distance & update workers 
+  dist_prototypes_prlwkr DistWorker(W, x);
+  update_prototypes_prlwkr UpdateWorker(W, alpha, x, nhb_factor);
+  
+  
+  // *** Initialize the monitoring worker
+  // If labels were given, assign them to the worker as well 
+  VQQuality_worker VQMwkr(BMUs, W.n_rows);
+  bool is_labeled = false;
+  if(XLabel.isNotNull()) {
+    arma::uvec XLabel_;
+    XLabel_ = Rcpp::as<arma::uvec>(XLabel);
+    VQMwkr.set_XLabel(XLabel_);
+    is_labeled = true;
+  }
+  
+  
+  
+  // *** Start learning 
+  auto start_time = std::chrono::high_resolution_clock::now(); 
+  while(!exit_flag) {
+    
+    iter++; 
+    
+    // Update learning rates 
+    alpha = alpha_schedule_.lower_bound(iter)->second;
+    lambda = lambda_schedule_.lower_bound(iter)->second;
+    
+    // Sample an x and scale it to [0,1]
+    unsigned int Xidx = distribution(generator);
+    nXsampled(Xidx)++; 
+    x = (X.row(Xidx) - minX) / (maxX - minX); 
+    
+    // Compute distances to all prototypes, rank them
+    DistWorker.calc_parallel(); 
+    rank_prototypes(rank, BMUs(Xidx), QEs(Xidx), DistWorker.dist); 
+    
+    // Compute neighborhood factor from this x to all W 
+    nhb_factor = arma::exp(-arma::conv_to<arma::vec>::from(rank) / lambda);
+    
+    // Compute contribution to cost from this x 
+    Costs(Xidx) = arma::accu(nhb_factor % DistWorker.dist);
+    
+    // Update prototypes 
+    if(parallel) UpdateWorker.calc_parallel(); else UpdateWorker.calc_serial(); 
+    
+    
+    if( iter % X.n_rows == 0) {
+      // Increment age
+      age++;
+      
+      // Compute monitoring measures and their changes 
+      deltas.update(BMUs, QEs, Costs);
+      if(parallel) VQMwkr.calc_parallel(); else VQMwkr.calc_serial();
+      
+      
+      // Store monitoring measures 
+      lrnhist.epoch.push_back(age); 
+      lrnhist.alpha.push_back(alpha); 
+      lrnhist.lambda.push_back(lambda); 
+      lrnhist.cost.push_back(deltas.Cost); 
+      lrnhist.MQE.push_back(deltas.MQE);
+      lrnhist.nhb_effect.push_back(deltas.NhbEffect);
+      lrnhist.delCost.push_back(deltas.delCost); 
+      lrnhist.delQE.push_back(deltas.delQE); 
+      lrnhist.delBMU.push_back(deltas.delBMU);
+      lrnhist.RFEntropy.push_back(VQMwkr.RFEntropy);
+      
+      if(is_labeled) {
+        lrnhist.RFLPurity.push_back(VQMwkr.RFLWAvgPurity);
+        lrnhist.RFLBattacharyya.push_back(VQMwkr.RFLBattDist); 
+        lrnhist.RFLUnique.push_back(VQMwkr.RFLUnique);
+      }
+
+
+      // Print monitoring measures, if requested       
+      if(verbose) {
+        
+        // Print headers first, and after every 10 reports 
+        if(age % 10 == 1) {
+          Rprintf("%5s%10s%10s%10s%10s%10s%10s%10s%10s%10s", "Epoch", "alpha", "lambda", "Cost", "MQE", "NhbEff", "delCost", "delQE", "delBMU", "RFEnt");
+          if(is_labeled) Rprintf("%10s%10s%10s", "RFLPur", "RFLBatt", "RFLUnq"); 
+          Rprintf("\n");
+        }
+        
+        Rprintf("%5u", age);
+        Rprintf("%10.3f", alpha);
+        Rprintf("%10.3f", lambda);
+        Rprintf("%10.5f", deltas.Cost);
+        Rprintf("%10.5f", deltas.MQE);
+        Rprintf("%10.3f", deltas.NhbEffect);
+        Rprintf("%10.3f", deltas.delCost);
+        Rprintf("%10.3f", deltas.delQE);
+        Rprintf("%10.3f", deltas.delBMU);
+        Rprintf("%10.3f", VQMwkr.RFEntropy);
+
+        if(is_labeled) {
+          Rprintf("%10.3f", VQMwkr.RFLWAvgPurity);
+          Rprintf("%10.3f", VQMwkr.RFLBattDist);
+          Rprintf("%10d", VQMwkr.RFLUnique);
+        }
+        Rprintf("\n");
+      } // close printer block 
+      
+      
+      
+      // *** Check for convergence
+      if(age>1 && lrnhist.delBMU.back() < tol_delBMU) npass_delBMU++; else npass_delBMU = 0;
+      if(age>1 && lrnhist.delQE.back() < tol_delQE) npass_delQE++; else npass_delQE = 0;
+      
+      if(max_epochs > 0 && int(age) >= max_epochs) {exit_flag = true; break;} 
+      if(npass_delBMU >= 3 && npass_delQE >= 3) {exit_flag = true; break;}
+      
+      
+      // *** Check for user interrupt 
+      // Return partial results
+      try {Rcpp::checkUserInterrupt();} catch(Rcpp::internal::InterruptedException e) {break;}
+      
+    } // close epoch monitoring 
+    
+  } // close learning 
+  
+  // Stop the clock 
+  auto stop_time = std::chrono::high_resolution_clock::now(); 
+  std::chrono::duration<double, std::ratio<60,1>> exec_time = stop_time - start_time;
+  
+  // Scale W back to data range 
+  W = W*(maxX - minX) + minX; 
+  
+  // Build output list 
+  Rcpp::List out; 
+  out["W"] = W; 
+  out["age"] = iter; 
+  out["alpha_start"] = alpha0;
+  out["alpha_end"] = alpha; 
+  out["alpha_schedule"] = alpha_schedule; 
+  out["lambda_start"] = lambda0;
+  out["lambda_end"] = lambda; 
+  out["lambda_schedule"] = lambda_schedule; 
+  out["tol_delBMU"] = tol_delBMU; 
+  out["tol_delQE"] = tol_delQE; 
+  out["max_epochs"] = max_epochs; 
+  out["exec_time"] = exec_time.count(); 
+  out["LearnHist"] = lrnhist.get_LearnHistDF(); 
+  
+  return out; 
+  
+}
+
+
+
